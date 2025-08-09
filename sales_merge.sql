@@ -1,53 +1,44 @@
-from airflow import DAG
-from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
-from airflow.providers.google.cloud.hooks.gcs import GCSHook
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
-from airflow.exceptions import AirflowFailException
-
-default_args = {
-    "start_date": days_ago(0),
-    "retries": 1,
-}
-
-with DAG(
-    'bindu_madhuri'
-    dag_id="run_sales_transform_sql_gcs",
-    default_args=default_args,
-    schedule_interval=None,
-    catchup=False,
-    description="Run transformation on tds_sales.sales_target using SQL from GCS",
-) as dag:
-
-    BUCKET_NAME = "us-central1-madhuri-2cca0acc-bucket"
-    SQL_OBJECT_NAME = "dags/sales.sql"
-
-    def load_sql(**kwargs):
-        try:
-            hook = GCSHook(gcp_conn_id="google_cloud_default")
-            sql_bytes = hook.download(bucket_name=BUCKET_NAME, object_name=SQL_OBJECT_NAME)
-            sql_text = sql_bytes.decode("utf-8")
-            # push into XCom
-            kwargs["ti"].xcom_push(key="sql_query", value=sql_text)
-        except Exception as e:
-            raise AirflowFailException(f"Failed to read SQL from GCS: {e}")
-
-    load_sql_task = PythonOperator(
-        task_id="load_sql_from_gcs",
-        python_callable=load_sql,
-        provide_context=True,
-    )
-
-    run_transform_sql = BigQueryInsertJobOperator(
-        task_id="run_sql_transform",
-        configuration={
-            "query": {
-                "query": "{{ ti.xcom_pull(key='sql_query', task_ids='load_sql_from_gcs') }}",
-                "useLegacySql": False,
-            }
-        },
-        location="US",
-        gcp_conn_id="google_cloud_default",
-    )
-
-    load_sql_task >> run_transform_sql
+MERGE INTO `tds_sales.sales_target` AS target
+USING `ds_sales.sales_source` AS source
+ON target.INVOICE_AND_ITEM_NUMBER = source.invoice_and_item_number
+ AND target.DATE = source.DATE
+ AND target.STORE_ID = SAFE_CAST(source.store_number AS INT64)  -- Casting to INT64
+WHEN MATCHED THEN
+ UPDATE SET
+   target.INVOICE_AND_ITEM_NUMBER = source.invoice_and_item_number,
+   target.DATE = source.DATE,
+   target.STORE_ID = SAFE_CAST(source.store_number AS INT64),  -- Casting to INT64
+   target.STORE_NM = source.Store_name,
+   target.ADDRESS = source.Address,
+   target.CITY = source.City,
+   target.ZIPCODE = source.Zip_code,
+   target.COUNTRY_NUM = source.County_number,
+   target.DW_UPDATE_TS = CURRENT_TIMESTAMP(),  -- Update timestamp for the record
+   target.DW_LAST_UPDATE_TS = CURRENT_TIMESTAMP()  -- Update last update timestamp
+WHEN NOT MATCHED THEN
+ INSERT (
+   INVOICE_AND_ITEM_NUMBER,
+   DATE,
+   STORE_ID,
+   STORE_NM,
+   ADDRESS,
+   CITY,
+   ZIPCODE,
+   COUNTRY_NUM,
+   DW_CREATE_TS,
+   DW_UPDATE_TS,
+   DW_LAST_UPDATE_TS
+ )
+ VALUES (
+   source.invoice_and_item_number,
+   source.DATE,
+   SAFE_CAST(source.store_number AS INT64),  -- Casting to INT64
+   source.Store_name,
+   source.Address,
+   source.City,
+   source.Zip_code,
+   source.County_number,
+   CURRENT_TIMESTAMP(),  -- Set current timestamp for DW_CREATE_TS
+   CURRENT_TIMESTAMP(),  -- Set current timestamp for DW_UPDATE_TS
+   '9999-01-01'  -- Default value for DW_LAST_UPDATE_TS
+ );
